@@ -121,6 +121,21 @@ func (s *Server) Router() http.Handler {
 			r.Get("/regulatory-samplings", s.listSamplings)
 			r.With(role("quality", "admin", "manager")).Post("/regulatory-samplings", s.createSampling)
 			r.With(role("quality", "admin", "manager")).Post("/regulatory-samplings/{id}/result", s.samplingResult)
+
+			// 直播间集中退货：场次 / 退货登记 / 四项处置 / 复盘 / 渠道同步 / 备货建议
+			r.Get("/live-sessions", s.listLiveSessions)
+			r.With(role("production", "admin", "manager")).Post("/live-sessions", s.createLiveSession)
+			r.Get("/live-sessions/{id}", s.getLiveSession)
+			r.Get("/live-returns", s.listLiveReturnBatches)
+			r.With(role("quality", "warehouse", "admin", "manager")).Post("/live-returns", s.openLiveReturn)
+			r.Get("/live-returns/{id}", s.getLiveReturnBatch)
+			r.With(role("quality", "warehouse", "admin", "manager")).Post("/live-returns/{id}/entries", s.addLiveReturnEntry)
+			r.With(role("quality", "admin", "manager")).Post("/live-returns/{id}/review", s.reviewLiveReturn)
+			r.Post("/live-entries/{id}/execute", s.executeLiveDisposal) // 角色按处置类型在处理器内校验
+			r.Get("/channel-reviews", s.listChannelReviews)
+			r.Get("/channel-reviews/{id}", s.getChannelReview)
+			r.With(role("quality", "admin", "manager")).Post("/channel-reviews/{id}/sync", s.syncChannelReview)
+			r.Get("/live-restock-advice", s.listRestockAdvice)
 		})
 	})
 

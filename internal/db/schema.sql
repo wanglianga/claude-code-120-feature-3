@@ -313,3 +313,112 @@ CREATE TABLE IF NOT EXISTS regulatory_samplings (
   result TEXT NOT NULL DEFAULT 'pending' CHECK (result IN ('pending','qualified','unqualified')),
   note TEXT
 );
+
+-- ================= 直播间集中退货 =================
+
+-- 直播场次：主播承诺（时效/文案）是复盘对比的基准
+CREATE TABLE IF NOT EXISTS live_sessions (
+  id BIGSERIAL PRIMARY KEY,
+  session_no TEXT UNIQUE NOT NULL,
+  channel_id BIGINT REFERENCES channels(id),
+  anchor TEXT NOT NULL,                            -- 主播
+  title TEXT NOT NULL,                             -- 场次主题
+  live_at TIMESTAMPTZ NOT NULL,                    -- 开播时间
+  promised_delivery_hours INT NOT NULL DEFAULT 48, -- 主播承诺到货时效（小时）
+  promise_text TEXT,                               -- 主播承诺文案（规格/赠品/坏单包赔等）
+  status TEXT NOT NULL DEFAULT 'live'
+    CHECK (status IN ('live','returning','reviewed')),
+  created_by BIGINT REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_live_session_channel ON live_sessions(channel_id);
+
+-- 一场直播针对某成品批次的集中退货（退货批次）
+CREATE TABLE IF NOT EXISTS live_return_batches (
+  id BIGSERIAL PRIMARY KEY,
+  batch_no TEXT UNIQUE NOT NULL,
+  session_id BIGINT NOT NULL REFERENCES live_sessions(id),
+  finished_batch_id BIGINT REFERENCES finished_batches(id),
+  opened_by BIGINT REFERENCES users(id),
+  opened_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  closed_at TIMESTAMPTZ,
+  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_lrb_session ON live_return_batches(session_id);
+
+-- 集中退货登记：四类原因（主播承诺不符/物流延迟/口味问题/批次质量异常）
+CREATE TABLE IF NOT EXISTS live_return_orders (
+  id BIGSERIAL PRIMARY KEY,
+  entry_no TEXT UNIQUE NOT NULL,
+  batch_id BIGINT NOT NULL REFERENCES live_return_batches(id) ON DELETE CASCADE,
+  order_id BIGINT REFERENCES orders(id),
+  reason_cat TEXT NOT NULL CHECK (reason_cat IN
+    ('promise_mismatch','logistics_delay','taste_problem','batch_quality')),
+  reason_detail TEXT,
+  qty NUMERIC(10,2) NOT NULL DEFAULT 1,            -- 退货数量（盒）
+  qty_kg NUMERIC(10,2) NOT NULL DEFAULT 0,         -- 退回重量（库存退回用）
+  amount NUMERIC(12,2) NOT NULL DEFAULT 0,         -- 退款额
+  promised_delivery_hours INT,                     -- 快照：主播承诺时效
+  actual_delivery_hours NUMERIC(8,1),              -- 实际到货时效（小时）
+  sample_result TEXT,                              -- 快照：批次留样/复检结论
+  registered_by BIGINT REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_lro_batch ON live_return_orders(batch_id);
+
+-- 每笔退货分别生成四项处置：退款 / 库存退回 / 客服话术 / 渠道扣款
+CREATE TABLE IF NOT EXISTS live_return_disposals (
+  id BIGSERIAL PRIMARY KEY,
+  doc_no TEXT UNIQUE NOT NULL,
+  entry_id BIGINT NOT NULL REFERENCES live_return_orders(id) ON DELETE CASCADE,
+  dtype TEXT NOT NULL CHECK (dtype IN ('refund','restock','script','channel_deduction')),
+  title TEXT,
+  content TEXT,
+  amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','done')),
+  executed_by TEXT,
+  executed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (entry_id, dtype)
+);
+CREATE INDEX IF NOT EXISTS idx_lrd_entry ON live_return_disposals(entry_id);
+
+-- 渠道复盘：对比主播承诺 / 实际到货时效 / 批次检测，形成建议并同步渠道
+CREATE TABLE IF NOT EXISTS channel_reviews (
+  id BIGSERIAL PRIMARY KEY,
+  review_no TEXT UNIQUE NOT NULL,
+  batch_id BIGINT NOT NULL REFERENCES live_return_batches(id),
+  channel_id BIGINT REFERENCES channels(id),
+  promise_summary TEXT,                            -- 对比①：主播承诺
+  delivery_summary TEXT,                           -- 对比②：实际到货时效
+  sample_summary TEXT,                             -- 对比③：批次检测
+  suggestion TEXT NOT NULL CHECK (suggestion IN
+    ('channel_deduction','quality_rectification','logistics_claim','none')),
+  suggestion_detail TEXT,
+  refund_total NUMERIC(12,2) NOT NULL DEFAULT 0,   -- 退款合计
+  deduction_amount NUMERIC(12,2) NOT NULL DEFAULT 0, -- 渠道扣款合计
+  restock_adjustment TEXT,                         -- 对下一场直播备货的影响
+  status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','synced')),
+  reviewed_by BIGINT REFERENCES users(id),
+  reviewed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  synced_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_review_batch ON channel_reviews(batch_id);
+CREATE INDEX IF NOT EXISTS idx_review_channel ON channel_reviews(channel_id);
+
+-- 复盘同步后形成的「下一场直播备货」建议（按成品批次保留最新一条）
+CREATE TABLE IF NOT EXISTS live_restock_advice (
+  id BIGSERIAL PRIMARY KEY,
+  finished_batch_id BIGINT NOT NULL REFERENCES finished_batches(id),
+  session_id BIGINT REFERENCES live_sessions(id),
+  review_id BIGINT REFERENCES channel_reviews(id),
+  direction TEXT NOT NULL CHECK (direction IN ('down','hold','switch_batch','pause')),
+  adjust_pct INT NOT NULL DEFAULT 0,            -- 备货量调整百分比（下调）
+  advice TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (finished_batch_id)
+);
+
+-- 库存退回执行后挂接既有退货三态处置（可复检/可返工/必须销毁）
+ALTER TABLE return_goods ADD COLUMN IF NOT EXISTS live_entry_id BIGINT REFERENCES live_return_orders(id);

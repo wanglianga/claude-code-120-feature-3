@@ -214,6 +214,146 @@ func Seed(ctx context.Context, p *pgxpool.Pool) error {
 		 SELECT 'EV20260903-01','temp_exceed','major',id,'RM20260903 入库温度 -15.1℃，高于冻品限值 -18℃','open',3
 		 FROM raw_material_batches WHERE batch_no='RM20260903'
 		 ON CONFLICT (event_no) DO NOTHING`,
+
+		// ================= 直播间集中退货 演示数据 =================
+
+		// 直播场次：LS...01 退货进行中；LS...02 已复盘结案
+		`INSERT INTO live_sessions(session_no,channel_id,anchor,title,live_at,promised_delivery_hours,promise_text,status,created_by)
+		 SELECT 'LS20260914-01',id,'海味小厨','开海节直播专场','2026-09-14 19:00+08',48,
+		        '全场顺丰冷链 48 小时送达；坏单包赔；缺斤少两退一赔三','returning',1
+		 FROM channels WHERE code='CH03' ON CONFLICT (session_no) DO NOTHING`,
+		`INSERT INTO live_sessions(session_no,channel_id,anchor,title,live_at,promised_delivery_hours,promise_text,status,created_by)
+		 SELECT 'LS20260916-02',id,'海味小厨','开海节返场直播','2026-09-16 19:00+08',48,
+		        '全场顺丰冷链 48 小时送达；坏单包赔；缺斤少两退一赔三','reviewed',1
+		 FROM channels WHERE code='CH03' ON CONFLICT (session_no) DO NOTHING`,
+
+		// 返场直播订单（供承诺不符/物流延迟退货关联）
+		`INSERT INTO orders(order_no,shipment_id,finished_batch_id,channel_id,box_no,qty,customer,status,sold_at)
+		 SELECT 'OD20260916-005',s.id,f.id,c.id,'BX-LIVE-0005',2,'直播观众王**','sold','2026-09-16 20:10+08'
+		 FROM shipments s, finished_batches f, channels c
+		 WHERE s.ship_no='SH20260913-01' AND f.batch_no='FG20260912-01' AND c.code='CH03'
+		 ON CONFLICT (order_no) DO NOTHING`,
+		`INSERT INTO orders(order_no,shipment_id,finished_batch_id,channel_id,box_no,qty,customer,status,sold_at)
+		 SELECT 'OD20260916-006',s.id,f.id,c.id,'BX-LIVE-0006',1,'直播观众林**','sold','2026-09-16 20:25+08'
+		 FROM shipments s, finished_batches f, channels c
+		 WHERE s.ship_no='SH20260913-01' AND f.batch_no='FG20260912-01' AND c.code='CH03'
+		 ON CONFLICT (order_no) DO NOTHING`,
+
+		// 集中退货批次①（进行中）：麻辣鱿鱼花 批次质量异常 + 口味问题
+		`INSERT INTO live_return_batches(batch_no,session_id,finished_batch_id,opened_by,note)
+		 SELECT 'LRB20260915-01',ls.id,f.id,3,'直播后观众集中反馈鱿鱼花异味，开启集中退货'
+		 FROM live_sessions ls, finished_batches f
+		 WHERE ls.session_no='LS20260914-01' AND f.batch_no='FG20260912-02'
+		 ON CONFLICT (batch_no) DO NOTHING`,
+		`INSERT INTO live_return_orders(entry_no,batch_id,order_id,reason_cat,reason_detail,qty,qty_kg,amount,
+		   promised_delivery_hours,actual_delivery_hours,sample_result,registered_by)
+		 SELECT 'LE20260915-001',b.id,o.id,'batch_quality','解冻后有氨味，疑似批次变质',1,0.50,69.90,
+		        48,50.0,'送检不合格（挥发性盐基氮超标）',3
+		 FROM live_return_batches b, orders o
+		 WHERE b.batch_no='LRB20260915-01' AND o.order_no='OD20260914-001'
+		 ON CONFLICT (entry_no) DO NOTHING`,
+		`INSERT INTO live_return_orders(entry_no,batch_id,order_id,reason_cat,reason_detail,qty,qty_kg,amount,
+		   promised_delivery_hours,actual_delivery_hours,sample_result,registered_by)
+		 SELECT 'LE20260915-002',b.id,o.id,'taste_problem','顾客反馈麻辣味发苦、口感发柴',1,0.50,69.90,
+		        48,44.0,'合格',3
+		 FROM live_return_batches b, orders o
+		 WHERE b.batch_no='LRB20260915-01' AND o.order_no='OD20260914-002'
+		 ON CONFLICT (entry_no) DO NOTHING`,
+		// 批次①四项处置（待执行，供演示逐项执行）
+		`INSERT INTO live_return_disposals(doc_no,entry_id,dtype,title,content,amount)
+		 SELECT d.doc,e.id,d.dt,d.ti,d.ct,d.am FROM live_return_orders e
+		 CROSS JOIN (VALUES
+		   ('LD20260915-001-R','refund','退款-LE20260915-001','向消费者退款 69.90 元（1 盒 × 69.90 元/盒），订单 OD20260914-001，原因：批次质量异常。',69.90::numeric),
+		   ('LD20260915-001-S','restock','库存退回-LE20260915-001','退回商品 1 盒 / 0.50 kg（成品 FG20260912-02 麻辣鱿鱼花）登记回厂，入「直播退货仓」隔离待判，后续按可复检/可返工/必须销毁三态处置。',0.50),
+		   ('LD20260915-001-C','script','客服话术-LE20260915-001','您好，经核实您反馈的商品存在批次质量异常。我们已第一时间为您全额退款 69.90 元，并对该批次启动复检与召回评估，请您不要继续食用。给您带来担忧，我们深表歉意。',0.00),
+		   ('LD20260915-001-D','channel_deduction','渠道扣款-LE20260915-001','非渠道责任（物流/工厂质量），渠道扣款 0 元：0.00 元（退款基数 69.90 元）。',0.00)
+		 ) AS d(doc,dt,ti,ct,am)
+		 WHERE e.entry_no='LE20260915-001' ON CONFLICT (doc_no) DO NOTHING`,
+		`INSERT INTO live_return_disposals(doc_no,entry_id,dtype,title,content,amount)
+		 SELECT d.doc,e.id,d.dt,d.ti,d.ct,d.am FROM live_return_orders e
+		 CROSS JOIN (VALUES
+		   ('LD20260915-002-R','refund','退款-LE20260915-002','向消费者退款 69.90 元（1 盒 × 69.90 元/盒），订单 OD20260914-002，原因：口味问题。',69.90::numeric),
+		   ('LD20260915-002-S','restock','库存退回-LE20260915-002','退回商品 1 盒 / 0.50 kg（成品 FG20260912-02 麻辣鱿鱼花）登记回厂，入「直播退货仓」隔离待判，后续按可复检/可返工/必须销毁三态处置。',0.50),
+		   ('LD20260915-002-C','script','客服话术-LE20260915-002','您好，很抱歉商品口味未达预期（顾客反馈麻辣味发苦、口感发柴）。我们已为您办理退款 69.90 元，并将您的反馈同步给调味工艺组整改；欢迎下次直播再给我们一次机会。',0.00),
+		   ('LD20260915-002-D','channel_deduction','渠道扣款-LE20260915-002','口味问题渠道选品连带，按退款额 30% 扣款：20.97 元（退款基数 69.90 元）。',20.97)
+		 ) AS d(doc,dt,ti,ct,am)
+		 WHERE e.entry_no='LE20260915-002' ON CONFLICT (doc_no) DO NOTHING`,
+
+		// 集中退货批次②（已结案）：蒜香虾仁 主播承诺不符 + 物流延迟
+		`INSERT INTO live_return_batches(batch_no,session_id,finished_batch_id,opened_by,opened_at,closed_at,status,note)
+		 SELECT 'LRB20260917-01',ls.id,f.id,3,'2026-09-17 09:00+08','2026-09-17 18:00+08','closed',
+		        '返场直播承诺不符与物流延迟集中退货'
+		 FROM live_sessions ls, finished_batches f
+		 WHERE ls.session_no='LS20260916-02' AND f.batch_no='FG20260912-01'
+		 ON CONFLICT (batch_no) DO NOTHING`,
+		`INSERT INTO live_return_orders(entry_no,batch_id,order_id,reason_cat,reason_detail,qty,qty_kg,amount,
+		   promised_delivery_hours,actual_delivery_hours,sample_result,registered_by)
+		 SELECT 'LE20260917-001',b.id,o.id,'promise_mismatch','主播承诺买二送一赠品未随箱',2,0.50,119.80,
+		        48,45.0,'合格',3
+		 FROM live_return_batches b, orders o
+		 WHERE b.batch_no='LRB20260917-01' AND o.order_no='OD20260916-005'
+		 ON CONFLICT (entry_no) DO NOTHING`,
+		`INSERT INTO live_return_orders(entry_no,batch_id,order_id,reason_cat,reason_detail,qty,qty_kg,amount,
+		   promised_delivery_hours,actual_delivery_hours,sample_result,registered_by)
+		 SELECT 'LE20260917-002',b.id,o.id,'logistics_delay','冷链延迟 60 小时送达，冰袋已化',1,0.25,59.90,
+		        48,60.0,'合格',3
+		 FROM live_return_batches b, orders o
+		 WHERE b.batch_no='LRB20260917-01' AND o.order_no='OD20260916-006'
+		 ON CONFLICT (entry_no) DO NOTHING`,
+		// 批次②四项处置（均已执行）
+		`INSERT INTO live_return_disposals(doc_no,entry_id,dtype,title,content,amount,status,executed_by,executed_at)
+		 SELECT d.doc,e.id,d.dt,d.ti,d.ct,d.am,'done',d.ex,'2026-09-17 17:00+08' FROM live_return_orders e
+		 CROSS JOIN (VALUES
+		   ('LD20260917-001-R','refund','退款-LE20260917-001','向消费者退款 119.80 元（2 盒 × 59.90 元/盒），订单 OD20260916-005，原因：主播承诺不符。',119.80::numeric,'finance'),
+		   ('LD20260917-001-S','restock','库存退回-LE20260917-001','退回商品 2 盒 / 0.50 kg（成品 FG20260912-01 蒜香虾仁）登记回厂，入「直播退货仓」隔离待判。',0.50,'warehouse'),
+		   ('LD20260917-001-C','script','客服话术-LE20260917-001','您好，非常抱歉本次直播商品与主播承诺不符（主播承诺买二送一赠品未随箱）。我们已为您办理全额退款 119.80 元，无需寄回商品；后续直播承诺文案将经品控审核后再上架，感谢您的监督。',0.00,'quality'),
+		   ('LD20260917-001-D','channel_deduction','渠道扣款-LE20260917-001','主播承诺不符，按退款额 100% 向渠道（主播/机构）扣款：119.80 元（退款基数 119.80 元）。',119.80,'复盘同步')
+		 ) AS d(doc,dt,ti,ct,am,ex)
+		 WHERE e.entry_no='LE20260917-001' ON CONFLICT (doc_no) DO NOTHING`,
+		`INSERT INTO live_return_disposals(doc_no,entry_id,dtype,title,content,amount,status,executed_by,executed_at)
+		 SELECT d.doc,e.id,d.dt,d.ti,d.ct,d.am,'done',d.ex,'2026-09-17 17:00+08' FROM live_return_orders e
+		 CROSS JOIN (VALUES
+		   ('LD20260917-002-R','refund','退款-LE20260917-002','向消费者退款 59.90 元（1 盒 × 59.90 元/盒），订单 OD20260916-006，原因：物流延迟。',59.90::numeric,'finance'),
+		   ('LD20260917-002-S','restock','库存退回-LE20260917-002','退回商品 1 盒 / 0.25 kg（成品 FG20260912-01 蒜香虾仁）登记回厂，入「直播退货仓」隔离待判。',0.25,'warehouse'),
+		   ('LD20260917-002-C','script','客服话术-LE20260917-002','您好，您的订单因冷链物流延迟（实际到货约 60.0 小时，超出承诺 48 小时）影响了体验，我们已为您退款 59.90 元，商品无需寄回。我们已同步启动对承运商的追责流程，抱歉久等。',0.00,'quality'),
+		   ('LD20260917-002-D','channel_deduction','渠道扣款-LE20260917-002','非渠道责任（物流/工厂质量），渠道扣款 0 元：0.00 元（退款基数 59.90 元）。',0.00,'复盘同步')
+		 ) AS d(doc,dt,ti,ct,am,ex)
+		 WHERE e.entry_no='LE20260917-002' ON CONFLICT (doc_no) DO NOTHING`,
+		// 批次②退回库存（直播退货仓 0.75kg 隔离待判）与回厂登记
+		`INSERT INTO return_goods(return_no,finished_batch_id,box_no,qty_kg,note,live_entry_id)
+		 SELECT 'RT20260917-01',f.id,'直播退货-LE20260917-001',0.50,'直播集中退货退回（LE20260917-001），隔离待判',e.id
+		 FROM finished_batches f, live_return_orders e
+		 WHERE f.batch_no='FG20260912-01' AND e.entry_no='LE20260917-001'
+		 ON CONFLICT (return_no) DO NOTHING`,
+		`INSERT INTO return_goods(return_no,finished_batch_id,box_no,qty_kg,note,live_entry_id)
+		 SELECT 'RT20260917-02',f.id,'直播退货-LE20260917-002',0.25,'直播集中退货退回（LE20260917-002），隔离待判',e.id
+		 FROM finished_batches f, live_return_orders e
+		 WHERE f.batch_no='FG20260912-01' AND e.entry_no='LE20260917-002'
+		 ON CONFLICT (return_no) DO NOTHING`,
+		`INSERT INTO inventory(finished_batch_id,location,qty_kg,status)
+		 SELECT id,'直播退货仓',0.75,'quarantined' FROM finished_batches WHERE batch_no='FG20260912-01'
+		 ON CONFLICT DO NOTHING`,
+		// 批次②渠道复盘（已同步）+ 下一场备货建议
+		`INSERT INTO channel_reviews(review_no,batch_id,channel_id,promise_summary,delivery_summary,sample_summary,
+		   suggestion,suggestion_detail,refund_total,deduction_amount,restock_adjustment,status,reviewed_by,reviewed_at,synced_at)
+		 SELECT 'RV20260917-01',b.id,c.id,
+		        '主播承诺：全场顺丰冷链 48 小时送达；坏单包赔；缺斤少两退一赔三（承诺到货时效 48 小时）',
+		        '实际到货时效均值 52.5 小时 / 最高 60.0 小时，1/2 单超出承诺 48 小时',
+		        '留样检测：SP-001 合格；退货登记中批次质量异常 0 笔、送检不合格 0 笔',
+		        'channel_deduction',
+		        '主播承诺不符退货 1 笔（退款 119.80 元），按退款额 100% 向渠道（主播/机构）扣款 119.80 元；承诺文案须整改。另物流延迟 1 单（60h>48h），建议同步向承运商追责。',
+		        179.70,119.80,
+		        '下一场直播备货量按本场 -20% 控制，主播承诺文案须经品控审核后上架。',
+		        'synced',3,'2026-09-17 18:00+08','2026-09-17 18:30+08'
+		 FROM live_return_batches b, channels c
+		 WHERE b.batch_no='LRB20260917-01' AND c.code='CH03'
+		 ON CONFLICT (review_no) DO NOTHING`,
+		`INSERT INTO live_restock_advice(finished_batch_id,session_id,review_id,direction,adjust_pct,advice,updated_at)
+		 SELECT f.id,ls.id,rv.id,'down',20,
+		        '下一场直播备货量按本场 -20% 控制，主播承诺文案须经品控审核后上架。','2026-09-17 18:30+08'
+		 FROM finished_batches f, live_sessions ls, channel_reviews rv
+		 WHERE f.batch_no='FG20260912-01' AND ls.session_no='LS20260916-02' AND rv.review_no='RV20260917-01'
+		 ON CONFLICT (finished_batch_id) DO NOTHING`,
 	}
 	for _, s := range stmts {
 		if _, err := p.Exec(ctx, s); err != nil {

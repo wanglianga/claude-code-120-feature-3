@@ -19,6 +19,9 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	q("returns_pending", `SELECT count(*) FROM return_goods WHERE disposition IS NULL`)
 	q("comp_pending", `SELECT count(*) FROM customer_compensations WHERE status='pending'`)
 	q("deduction_pending", `SELECT count(*) FROM supplier_deductions WHERE status<>'deducted'`)
+	q("live_return_open", `SELECT count(*) FROM live_return_batches WHERE status='open'`)
+	q("live_disposal_pending", `SELECT count(*) FROM live_return_disposals WHERE status='pending'`)
+	q("reviews_draft", `SELECT count(*) FROM channel_reviews WHERE status='draft'`)
 	var stock, quarantine float64
 	_ = s.pool.QueryRow(ctx, `SELECT COALESCE(sum(qty_kg),0) FROM inventory WHERE status='available'`).Scan(&stock)
 	_ = s.pool.QueryRow(ctx, `SELECT COALESCE(sum(qty_kg),0) FROM inventory WHERE status='quarantined'`).Scan(&quarantine)

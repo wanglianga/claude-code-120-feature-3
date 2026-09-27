@@ -42,7 +42,19 @@ const STATUS_TAG = {
   shipped: ['blue', '已发货'], pending: ['amber', '待处理'], paid: ['green', '已赔付'],
   confirmed: ['blue', '已确认'], deducted: ['green', '已扣款'],
   qualified: ['green', '合格'], unqualified: ['red', '不合格'],
+  live: ['blue', '直播中'], returning: ['red', '集中退货中'], reviewed: ['gray', '已复盘'],
+  draft: ['amber', '待同步'], synced: ['green', '已同步'], done: ['green', '已执行'],
 };
+const REASON_CAT = {
+  promise_mismatch: ['amber', '主播承诺不符'], logistics_delay: ['blue', '物流延迟'],
+  taste_problem: ['purple', '口味问题'], batch_quality: ['red', '批次质量异常'],
+};
+const DTYPE_LIVE = { refund: '退款', restock: '库存退回', script: '客服话术', channel_deduction: '渠道扣款' };
+const SUGGESTION = {
+  channel_deduction: ['amber', '渠道扣款'], quality_rectification: ['red', '质量整改'],
+  logistics_claim: ['blue', '物流追责'], none: ['gray', '无需专项处置'],
+};
+const DIRECTION = { down: ['amber', '下调备货'], hold: ['blue', '维持备货'], pause: ['red', '暂停备货'], switch_batch: ['purple', '更换批次'] };
 const ETYPE = {
   temp_exceed: '原料温度超标', thaw_timeout: '解冻超时', seasoning_mismatch: '调味料批次用错',
   metal_alarm: '金检报警', package_leak: '包装漏气', channel_odor: '渠道反馈异味',
@@ -87,9 +99,9 @@ $('#logout-btn').addEventListener('click', async () => {
 
 const TABS = [
   ['dashboard', '仪表盘'], ['raw', '原料入库'], ['production', '生产加工'],
-  ['finished', '成品批次'], ['channel', '渠道履约'], ['events', '品控事件'],
-  ['recalls', '召回管理'], ['returns', '退货处置'], ['inventory', '冷库库存'],
-  ['finance', '财务追偿'], ['sampling', '监管抽样'],
+  ['finished', '成品批次'], ['channel', '渠道履约'], ['live', '直播退货'],
+  ['events', '品控事件'], ['recalls', '召回管理'], ['returns', '退货处置'],
+  ['inventory', '冷库库存'], ['finance', '财务追偿'], ['sampling', '监管抽样'],
 ];
 
 function enterApp() {
@@ -108,9 +120,9 @@ function render() {
   $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === state.tab));
   const pages = {
     dashboard: pageDashboard, raw: pageRaw, production: pageProduction,
-    finished: pageFinished, channel: pageChannel, events: pageEvents,
-    recalls: pageRecalls, returns: pageReturns, inventory: pageInventory,
-    finance: pageFinance, sampling: pageSampling,
+    finished: pageFinished, channel: pageChannel, live: pageLive,
+    events: pageEvents, recalls: pageRecalls, returns: pageReturns,
+    inventory: pageInventory, finance: pageFinance, sampling: pageSampling,
   };
   $('#content').innerHTML = '';
   pages[state.tab]();
@@ -196,6 +208,9 @@ async function pageDashboard() {
       ${kpi(d.quarantine_kg + ' kg', '召回隔离库存', d.quarantine_kg ? 'danger' : '')}
       ${kpi(d.events_open, '待处置品控事件', d.events_open ? 'warn' : 'ok')}
       ${kpi(d.recalls_active, '执行中召回', d.recalls_active ? 'danger' : 'ok')}
+      ${kpi(d.live_return_open, '进行中集中退货', d.live_return_open ? 'danger' : 'ok')}
+      ${kpi(d.live_disposal_pending, '待执行退货处置', d.live_disposal_pending ? 'warn' : 'ok')}
+      ${kpi(d.reviews_draft, '待同步渠道复盘', d.reviews_draft ? 'warn' : 'ok')}
       ${kpi(d.returns_pending, '退货待判定', d.returns_pending ? 'warn' : 'ok')}
       ${kpi(d.comp_pending, '待支付赔付', d.comp_pending ? 'warn' : 'ok')}
       ${kpi(d.deduction_pending, '待落实供应商扣款', d.deduction_pending ? 'warn' : 'ok')}
@@ -205,7 +220,9 @@ async function pageDashboard() {
         ① 在「原料入库」查看 RM20260903（入库温度 -15.1℃ 自动锁定）→ 点「正向追溯」看它流入成品 FG20260912-02；<br>
         ② 在「品控事件」对 <b>EV20260903-01</b> 发起召回，系统自动圈定成品、已发货渠道、在库库存、已售订单（精确到箱）与留样结果，并生成停售/退货/赔偿/供应商追责四类材料；<br>
         ③ 在「召回管理」打开召回单查看材料；「退货处置」登记退货并分别判定 可复检/可返工/必须销毁，观察库存状态变化；<br>
-        ④ 「财务追偿」支付消费者赔付、确认供应商扣款；监管抽样不合格会自动生成监管召回事件。
+        ④ 「直播退货」对进行中的集中退货批次 <b>LRB20260915-01</b> 登记四类原因退货（主播承诺不符/物流延迟/口味问题/批次质量异常），逐笔执行 退款/库存退回/客服话术/渠道扣款 四项处置；<br>
+        ⑤ 「退货结束·生成复盘」对比主播承诺、实际到货时效与批次检测，形成渠道扣款/质量整改/物流追责建议；「同步复盘」更新渠道复盘并生成下一场直播备货建议；<br>
+        ⑥ 「财务追偿」支付消费者赔付、确认供应商扣款；监管抽样不合格会自动生成监管召回事件。
       </div>
     </div></div>`;
 }
@@ -758,6 +775,219 @@ async function pageSampling() {
   };
   $$('button[data-pass]').forEach(b => b.onclick = () => result(b.dataset.pass, 'qualified'));
   $$('button[data-fail]').forEach(b => b.onclick = () => result(b.dataset.fail, 'unqualified'));
+}
+
+/* ---------- 直播间集中退货 ---------- */
+
+async function pageLive() {
+  const [sessions, batches, reviews, advice, channels, fbs] = await Promise.all([
+    api('/live-sessions'), api('/live-returns'), api('/channel-reviews'),
+    api('/live-restock-advice'), api('/channels'), api('/finished-batches')]);
+  const liveChannels = channels.filter(c => c.ctype === '直播');
+  const openSessions = sessions.filter(s => s.status !== 'reviewed');
+  const acts = (can('production', 'manager') ? `<button class="act" id="new-live">🎬 新建直播场次</button>` : '') +
+    (can('quality', 'warehouse', 'manager') ? ` <button class="act amber" id="open-ret">📦 开启集中退货</button>` : '');
+  $('#content').innerHTML = pageHead('直播间集中退货 · 四项处置 · 渠道复盘',
+    '区分 主播承诺不符/物流延迟/口味问题/批次质量异常；退款、库存退回、客服话术、渠道扣款分别生成；复盘对比主播承诺/到货时效/批次检测，结论影响下一场备货', acts) +
+    `<div class="panel"><h3>直播场次（主播承诺为复盘基准）</h3>${table([
+      { t: '场次号', k: 'session_no' }, { t: '主题', k: 'title' }, { t: '主播', k: 'anchor' },
+      { t: '渠道', k: 'channel' }, { t: '开播时间', k: 'live_at' },
+      { t: '承诺时效', fn: r => r.promised_delivery_hours + 'h' },
+      { t: '退货批次', k: 'return_batches' },
+      { t: '退款合计', fn: r => '¥' + fmtNum(r.refund_total) },
+      { t: '状态', k: 'status', tag: true },
+      { t: '操作', fn: r => `<button class="act" data-sess="${r.id}">详情</button>` },
+    ], sessions)}</div>
+    <div class="panel"><h3>集中退货批次（逐笔登记 → 四项处置分别生成）</h3>${table([
+      { t: '退货批次号', k: 'batch_no' },
+      { t: '直播场次', fn: r => `${esc(r.session_no)} ${esc(r.session_title)}` },
+      { t: '成品', fn: r => `${esc(r.finished_batch_no)} ${esc(r.product_name)}` },
+      { t: '退货笔数', k: 'entries' },
+      { t: '退款合计', fn: r => '¥' + fmtNum(r.refund_total) },
+      { t: '待执行处置', fn: r => Number(r.pending_disposals) ? `<b style="color:#b45309">${r.pending_disposals}</b>` : '0' },
+      { t: '状态', k: 'status', tag: true },
+      { t: '操作', fn: r => `<button class="act" data-batch="${r.id}">明细/处置</button>` +
+          (r.status === 'open' && can('quality', 'warehouse', 'manager') ? ` <button class="act amber" data-entry="${r.id}">登记退货</button>` : '') +
+          (r.status === 'open' && can('quality', 'manager') ? ` <button class="act red" data-review="${r.id}">退货结束·生成复盘</button>` : '') },
+    ], batches)}</div>
+    <div class="panel"><h3>渠道复盘（对比主播承诺 / 实际到货时效 / 批次检测）</h3>${table([
+      { t: '复盘号', k: 'review_no' },
+      { t: '场次', fn: r => `${esc(r.session_no)} ${esc(r.session_title)}` },
+      { t: '渠道', k: 'channel' },
+      { t: '建议', fn: r => { const g = SUGGESTION[r.suggestion] || ['gray', r.suggestion]; return `<span class="tag ${g[0]}">${g[1]}</span>`; } },
+      { t: '退款合计', fn: r => '¥' + fmtNum(r.refund_total) },
+      { t: '渠道扣款', fn: r => '¥' + fmtNum(r.deduction_amount) },
+      { t: '状态', k: 'status', tag: true },
+      { t: '操作', fn: r => `<button class="act" data-rv="${r.id}">复盘详情</button>` +
+          (r.status === 'draft' && can('quality', 'manager') ? ` <button class="act green" data-sync="${r.id}">同步渠道复盘</button>` : '') },
+    ], reviews)}</div>
+    <div class="panel"><h3>下一场直播备货建议（复盘同步后生成）</h3>${table([
+      { t: '成品批次', k: 'finished_batch_no' }, { t: '产品', k: 'product_name' },
+      { t: '来源场次', k: 'session_no' }, { t: '来源复盘', k: 'review_no' },
+      { t: '备货动作', fn: r => { const g = DIRECTION[r.direction] || ['gray', r.direction]; return `<span class="tag ${g[0]}">${g[1]}</span>`; } },
+      { t: '下调幅度', fn: r => Number(r.adjust_pct) ? r.adjust_pct + '%' : '—' },
+      { t: '建议内容', k: 'advice', cls: 'wrap' }, { t: '更新时间', k: 'updated_at' },
+    ], advice)}</div>`;
+
+  $('#new-live')?.addEventListener('click', () => modalForm('新建直播场次', [
+    { name: 'session_no', label: '场次号（留空自动生成）' },
+    { name: 'channel_code', label: '直播渠道', type: 'select', opts: liveChannels.map(c => ({ v: c.code, t: c.code + ' ' + c.name })) },
+    { name: 'anchor', label: '主播 *' },
+    { name: 'title', label: '场次主题 *' },
+    { name: 'live_at', label: '开播时间', ph: '2026-09-20T19:00（留空=现在）' },
+    { name: 'promised_delivery_hours', label: '承诺到货时效（小时）', type: 'number', def: '48' },
+    { name: 'promise_text', label: '主播承诺文案', type: 'textarea', full: true, ph: '如：48小时冷链送达；坏单包赔；缺斤少两退一赔三' },
+  ], async b => {
+    if (!b.session_no) delete b.session_no;
+    if (!b.live_at) delete b.live_at;
+    const r = await api('/live-sessions', { method: 'POST', body: b });
+    toast('直播场次已创建：' + r.session_no, 'ok');
+  }, '创建'));
+
+  $('#open-ret')?.addEventListener('click', () => modalForm('开启集中退货（按场次 × 成品批次）', [
+    { name: 'session_no', label: '直播场次', type: 'select', opts: openSessions.map(s => ({ v: s.session_no, t: s.session_no + ' ' + s.title })) },
+    { name: 'finished_batch_no', label: '成品批次', type: 'select', opts: fbs.map(f => ({ v: f.batch_no, t: f.batch_no + ' ' + f.product_name })) },
+    { name: 'note', label: '开启说明', type: 'textarea', full: true, ph: '如：直播后观众集中反馈异味' },
+  ], b => api('/live-returns', { method: 'POST', body: b }).then(r => toast('集中退货已开启：' + r.batch_no, 'ok')), '开启'));
+
+  $$('button[data-sess]').forEach(b => b.onclick = () => showLiveSession(b.dataset.sess));
+  $$('button[data-batch]').forEach(b => b.onclick = () => showLiveBatch(b.dataset.batch));
+  $$('button[data-entry]').forEach(b => b.onclick = () => liveEntryForm(b.dataset.entry));
+  $$('button[data-review]').forEach(b => b.onclick = async () => {
+    if (!confirm('确认结束该集中退货并生成渠道复盘？')) return;
+    const r = await api(`/live-returns/${b.dataset.review}/review`, { method: 'POST' });
+    const g = SUGGESTION[r.suggestion] || ['gray', r.suggestion];
+    toast(`复盘 ${r.review_no} 已生成：建议「${g[1]}」，退款 ¥${fmtNum(r.refund_total)}，渠道扣款 ¥${fmtNum(r.deduction_amount)}`, 'ok');
+    render();
+  });
+  $$('button[data-rv]').forEach(b => b.onclick = () => showLiveReview(b.dataset.rv));
+  $$('button[data-sync]').forEach(b => b.onclick = async () => {
+    const r = await api(`/channel-reviews/${b.dataset.sync}/sync`, { method: 'POST' });
+    toast('复盘已同步渠道' + (r.auto_event_no ? '，自动升级品控事件 ' + r.auto_event_no : '') + '；下一场备货建议已更新', r.auto_event_no ? 'err' : 'ok');
+    render();
+  });
+}
+
+function liveEntryForm(batchId) {
+  modalForm('登记集中退货（四类原因，四项处置分别生成）', [
+    { name: 'order_no', label: '关联订单号（可空）', ph: 'OD20260914-001' },
+    { name: 'reason_cat', label: '退货原因分类', type: 'select', opts: Object.keys(REASON_CAT).map(k => ({ v: k, t: REASON_CAT[k][1] })) },
+    { name: 'reason_detail', label: '原因明细', type: 'textarea', full: true, ph: '如：解冻后有氨味 / 承诺赠品未随箱 / 冷链延迟冰袋已化' },
+    { name: 'qty', label: '退货数量（盒）', type: 'number', def: '1' },
+    { name: 'qty_kg', label: '退回重量 kg（留空按 0.25kg/盒）', type: 'number', step: '0.01' },
+    { name: 'unit_price', label: '单价 元/盒（留空默认 59.9）', type: 'number', step: '0.01' },
+    { name: 'actual_delivery_hours', label: '实际到货时效（小时，可空）', type: 'number', step: '0.5' },
+    { name: 'sample_result', label: '批次检测结论', type: 'select', opts: [
+      { v: '', t: '未登记' }, { v: '合格', t: '合格' }, { v: '不合格', t: '不合格' }, { v: '待复检', t: '待复检' }] },
+  ], async b => {
+    const r = await api(`/live-returns/${batchId}/entries`, { method: 'POST', body: b });
+    toast(`退货 ${r.entry_no} 已登记，退款/库存退回/客服话术/渠道扣款已分别生成` +
+      (r.auto_event_no ? '；批次质量异常自动升级品控事件 ' + r.auto_event_no : ''), r.auto_event_no ? 'err' : 'ok');
+  }, '登记并生成四项处置');
+}
+
+async function showLiveSession(id) {
+  const d = await api(`/live-sessions/${id}`);
+  const s = d.session;
+  const kv = (k, v) => `<dt>${k}</dt><dd>${v}</dd>`;
+  modalView(`直播场次 ${s.session_no}`, `
+    <div class="panel"><h3>场次档案</h3><div class="panel-body"><dl class="kv" style="grid-template-columns:120px 1fr 120px 1fr">
+      ${kv('主题', esc(s.title))}${kv('主播', esc(s.anchor))}
+      ${kv('渠道', esc(s.channel || ''))}${kv('开播时间', esc(s.live_at))}
+      ${kv('承诺时效', s.promised_delivery_hours + ' 小时')}${kv('状态', tag(s.status))}
+      ${kv('承诺文案', esc(s.promise_text))}${kv('', '')}
+    </dl></div></div>
+    <div class="panel"><h3>集中退货批次</h3>${table([
+      { t: '退货批次号', k: 'batch_no' },
+      { t: '成品', fn: r => `${esc(r.finished_batch_no)} ${esc(r.product_name)}` },
+      { t: '退货笔数', k: 'entries' }, { t: '退款合计', fn: r => '¥' + fmtNum(r.refund_total) },
+      { t: '状态', k: 'status', tag: true },
+      { t: '操作', fn: r => `<button class="act" data-b2="${r.id}">明细</button>` },
+    ], d.return_batches)}</div>
+    <div class="panel"><h3>渠道复盘</h3>${table([
+      { t: '复盘号', k: 'review_no' },
+      { t: '建议', fn: r => { const g = SUGGESTION[r.suggestion] || ['gray', r.suggestion]; return `<span class="tag ${g[0]}">${g[1]}</span>`; } },
+      { t: '渠道扣款', fn: r => '¥' + fmtNum(r.deduction_amount) },
+      { t: '下一场备货', k: 'restock_adjustment', cls: 'wrap' },
+      { t: '状态', k: 'status', tag: true },
+    ], d.reviews)}</div>`);
+  $$('button[data-b2]').forEach(x => x.onclick = () => showLiveBatch(x.dataset.b2));
+}
+
+async function showLiveBatch(id) {
+  const d = await api(`/live-returns/${id}`);
+  const b = d.batch;
+  const docCls = { refund: 'comp', restock: 'ret', script: '', channel_deduction: 'clm' };
+  const execRole = { refund: ['finance', 'manager'], restock: ['warehouse', 'manager'], script: ['quality', 'manager'], channel_deduction: ['finance', 'manager'] };
+  const kv = (k, v) => `<dt>${k}</dt><dd>${v}</dd>`;
+  modalView(`集中退货批次 ${b.batch_no}`, `
+    <div class="flow-note">场次 ${esc(b.session_no)}「${esc(b.session_title)}」 · 主播 ${esc(b.anchor)} · 成品 ${esc(b.finished_batch_no)} ${esc(b.product_name)} · 状态 ${tag(b.status)}<br>
+    主播承诺：${esc(b.promise_text)}（承诺时效 ${b.promised_delivery_hours}h）${b.note ? ' · 说明：' + esc(b.note) : ''}</div>
+    ${d.entries.length ? d.entries.map(e => {
+      const rc = REASON_CAT[e.reason_cat] || ['gray', e.reason_cat];
+      return `<div class="panel"><h3>退货 ${esc(e.entry_no)} · <span class="tag ${rc[0]}">${rc[1]}</span> · 退款 ¥${fmtNum(e.amount)}</h3>
+      <div class="panel-body">
+        <dl class="kv" style="grid-template-columns:110px 1fr 110px 1fr">
+          ${kv('关联订单', esc(e.order_no || '—'))}${kv('数量/重量', e.qty + ' 盒 / ' + fmtNum(e.qty_kg) + ' kg')}
+          ${kv('承诺/实际时效', (e.promised_delivery_hours ?? '—') + 'h / ' + (e.actual_delivery_hours ?? '—') + 'h')}
+          ${kv('批次检测', esc(e.sample_result || '未登记'))}
+          ${kv('原因明细', esc(e.reason_detail || ''))}${kv('登记时间', esc(e.created_at))}
+        </dl>
+        ${(e.disposals || []).map(x => `
+          <div class="doc-card ${docCls[x.dtype]}">
+            <div class="doc-title">【${DTYPE_LIVE[x.dtype]}】${esc(x.title)} <span class="tag gray">${esc(x.doc_no)}</span>
+              ${x.status === 'done' ? '<span class="tag green">已执行</span>' : '<span class="tag amber">待执行</span>'}
+              ${Number(x.amount) ? '　¥' + fmtNum(x.amount) : ''}</div>
+            <div class="doc-content">${esc(x.content)}</div>
+            ${x.status === 'done'
+              ? `<div class="doc-meta">执行人：${esc(x.executed_by)}　${esc(x.executed_at || '')}</div>`
+              : (can(...execRole[x.dtype]) && b.status === 'open'
+                ? `<div class="form-actions"><button class="act green" data-exec="${e.id}:${x.dtype}">执行${DTYPE_LIVE[x.dtype]}</button></div>` : '')}
+          </div>`).join('')}
+      </div></div>`;
+    }).join('') : '<div class="flow-note">暂无退货登记</div>'}
+    ${d.reviews.length ? '<h3 style="margin:14px 0 8px">渠道复盘</h3>' + d.reviews.map(rv => {
+      const g = SUGGESTION[rv.suggestion] || ['gray', rv.suggestion];
+      return `<div class="doc-card clm">
+        <div class="doc-title">【复盘 ${esc(rv.review_no)}】建议：<span class="tag ${g[0]}">${g[1]}</span> ${tag(rv.status)}</div>
+        <div class="doc-content">对比① ${esc(rv.promise_summary)}\n对比② ${esc(rv.delivery_summary)}\n对比③ ${esc(rv.sample_summary)}\n建议：${esc(rv.suggestion_detail)}\n下一场备货：${esc(rv.restock_adjustment)}</div>
+      </div>`;
+    }).join('') : ''}
+    ${b.status === 'open' && can('quality', 'manager') ? `<div class="form-actions"><button class="act red" id="do-review">退货结束·生成复盘</button></div>` : ''}`);
+  $$('button[data-exec]').forEach(btn => btn.onclick = async () => {
+    const [eid, dtype] = btn.dataset.exec.split(':');
+    const r = await api(`/live-entries/${eid}/execute`, { method: 'POST', body: { dtype } });
+    toast(`${DTYPE_LIVE[dtype]}已执行` + (r.note ? '：' + r.note : ''), 'ok');
+    showLiveBatch(id);
+  });
+  $('#do-review')?.addEventListener('click', async () => {
+    const r = await api(`/live-returns/${id}/review`, { method: 'POST' });
+    toast(`复盘 ${r.review_no} 已生成`, 'ok');
+    closeModal(); state.tab = 'live'; render();
+  });
+}
+
+async function showLiveReview(id) {
+  const rv = await api(`/channel-reviews/${id}`);
+  const g = SUGGESTION[rv.suggestion] || ['gray', rv.suggestion];
+  modalView(`渠道复盘 ${rv.review_no}`, `
+    <div class="flow-note">场次 ${esc(rv.session_no)}「${esc(rv.session_title)}」 · 主播 ${esc(rv.anchor)} · 渠道 ${esc(rv.channel)} · 退货批次 ${esc(rv.return_batch_no)} · 状态 ${tag(rv.status)}</div>
+    <div class="trace-grid">
+      <div class="panel"><h3>对比① 主播承诺</h3><div class="panel-body">${esc(rv.promise_summary)}</div></div>
+      <div class="panel"><h3>对比② 实际到货时效</h3><div class="panel-body">${esc(rv.delivery_summary)}</div></div>
+      <div class="panel"><h3>对比③ 批次检测</h3><div class="panel-body">${esc(rv.sample_summary)}</div></div>
+      <div class="panel"><h3>复盘结论</h3><div class="panel-body">
+        建议：<span class="tag ${g[0]}">${g[1]}</span><br><br>${esc(rv.suggestion_detail)}<br><br>
+        退款合计 <b>¥${fmtNum(rv.refund_total)}</b> · 渠道扣款 <b>¥${fmtNum(rv.deduction_amount)}</b>
+      </div></div>
+      <div class="panel full"><h3>对下一场直播备货的影响</h3><div class="panel-body">${esc(rv.restock_adjustment)}</div></div>
+    </div>
+    ${rv.status === 'draft' && can('quality', 'manager') ? `<div class="form-actions"><button class="act green" id="do-sync">同步渠道复盘</button></div>` : ''}`);
+  $('#do-sync')?.addEventListener('click', async () => {
+    const r = await api(`/channel-reviews/${id}/sync`, { method: 'POST' });
+    toast('复盘已同步' + (r.auto_event_no ? '，自动升级品控事件 ' + r.auto_event_no : ''), r.auto_event_no ? 'err' : 'ok');
+    closeModal(); render();
+  });
 }
 
 boot();
