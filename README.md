@@ -1,8 +1,9 @@
 # 海鲜预制菜工厂 · 批次解冻加工与召回服务
 
 基于 **Go 1.23 + PostgreSQL 16 + Redis 7** 的海鲜预制菜（虾仁 / 扇贝 / 鱿鱼 / 鱼柳）工厂
-批次解冻加工、全链追溯与召回处置系统。覆盖「采购入库 → 仓储温控 → 解冻加工 → 留样检测 →
-渠道发货 → 品控事件 → 精准召回 → 退货三态处置 → 客服赔付 / 供应商追偿 → 监管抽样」全流程。
+批次解冻加工、全链追溯、召回处置与**直播间集中退货复盘**系统。覆盖「采购入库 → 仓储温控 →
+解冻加工 → 留样检测 → 渠道发货 → 品控事件 → 精准召回 → 退货三态处置 → 客服赔付 / 供应商追偿
+→ 监管抽样 → **直播集中退货四因分流 / 复盘 / 渠道同步 / 下场备货**」全流程。
 
 ---
 
@@ -77,6 +78,10 @@ docker compose down
 - 发货单 `SH20260913-01/02`，已售订单 `OD20260914-001/002/003、OD20260915-010`（精确到箱号）。
 - 渠道反馈：直播间就 `FG20260912-02` 反馈异味。
 - 冷库库存：FG20260912-01 余 115kg、FG20260912-02 余 100kg。
+- **直播集中退货 `LR20260916-01`（抖音海鲜专场 LS20260916，已登记待复盘）**：4 单退货分别为
+  批次质量异常（`OD20260916-L01`，56h 到货、到厂不合格，建议销毁）、主播承诺不符（`-L02`，建议复检）、
+  物流延迟（`-L03`，承诺 48h/实际 76h，建议复检）、口味问题（`-L04`，建议返工）；
+  四类单据（退款/库存退回/客服话术/渠道扣款）已分别生成，退款合计 299.5 元、扣款合计 179.7 元。
 
 ### 建议演示路径（端到端走一遍召回闭环）
 
@@ -86,6 +91,11 @@ docker compose down
 4. 「退货处置」→ 登记退货回厂，分别判定 **可复检 / 可返工 / 必须销毁**，观察冷库库存按状态独立流转。
 5. 「财务追偿」→ 支付消费者赔付、确认供应商扣款。
 6. 「监管抽样」→ 登记抽样并录入「不合格」，系统自动生成「监管要求召回」事件，可再次发起召回。
+7. **「直播退货」→ 打开 `LR20260916-01`**：查看四类原因分流与四类单据；点「生成复盘」对比
+   主播承诺·实际到货时效·批次留样检测（含原料 RM20260903 入库温度/解冻 290 分钟超限），
+   系统输出**渠道扣款 / 质量整改 / 物流追责**建议与**下一场直播备货调整**（麻辣鱿鱼花因批次质量
+   停播=0kg、蒜香虾仁压减至 34.65kg），再「同步渠道」并登记渠道回执。也可「登记直播集中退货」
+   新建一场，批次质量异常会自动生成 critical 品控事件，衔接召回闭环。
 
 ---
 
@@ -108,6 +118,11 @@ docker compose down
 | 冷库盘点 | 按库位快照系统库存生成盘点单与明细 |
 | 监管抽样 | 原料/成品抽样登记，**抽检不合格自动生成监管召回事件** |
 | 渠道反馈异味 / 直播集中退货 | 反馈登记自动生成对应等级品控事件 |
+| 直播集中退货四因分流 | 逐单归入 主播承诺不符/物流延迟/口味问题/批次质量异常，分别生成 退款单·库存退回单·客服话术·渠道扣款单 |
+| 退货后复盘对比 | 对比 主播承诺快照 / 实际到货时效 / 批次留样检测（含原料温控、解冻时长） |
+| 复盘三类建议 | 渠道扣款（承诺/质量违约金）、质量整改（同线原料·解冻·留样复核）、物流追责（超时路由索赔） |
+| 渠道复盘同步 | 复盘结论 + 建议 + 备货调整生成渠道同步单，渠道回执确认 |
+| 复盘影响下场备货 | 批次质量→该品停播 0kg；承诺不符→压减 70%；物流延迟→80% 收缩远区；口味→90% 调配方 |
 
 库存状态机：成品库存 `available → quarantined（召回隔离）→ reworked / destroyed（退货处置）`，
 账面可用量与隔离/返工/销毁量分开统计，召回不会冲销可用量数字造成失真。
@@ -127,20 +142,68 @@ docker compose down
 - 库存：`GET /inventory`、`GET/POST /stocktakes`
 - 财务：`GET/POST /deductions`、`POST /deductions/{id}/status`、`GET/POST /compensations`、`POST /compensations/{id}/pay`
 - 监管：`GET/POST /regulatory-samplings`、`POST /regulatory-samplings/{id}/result`
+- **直播集中退货**：
+  - `GET /live-returns`、`GET /live-returns/{id}`（含四类单据、复盘、建议、同步、备货）
+  - `POST /live-returns`（登记批次 + 逐单四类原因，自动生成退款/库存退回/客服话术/渠道扣款）
+  - `POST /live-returns/{id}/review`（对比承诺·到货时效·批次检测，生成三类建议与下场备货）
+  - `POST /live-returns/{id}/sync`（渠道复盘同步）、`POST /live-returns/{id}/syncs/{syncId}/respond`（渠道回执）
+  - `POST /live-returns/{id}/close`（结案）
+  - `POST /live-refunds/{id}/pay`（财务退款）、`POST /live-charges/{id}/status`（渠道扣款 确认/已扣款）
 
-快速接口自测：
+快速接口自测（直播集中退货闭环）：
 
 ```bash
 BASE=http://localhost:${CC_PUBLISH_PORT:-3120}
 curl -s -c /tmp/ck -X POST $BASE/api/auth/login -H 'Content-Type: application/json' \
-  -d '{"username":"manager","password":"manager123"}'
-curl -s -b /tmp/ck $BASE/api/raw-batches | head -c 400
-curl -s -b /tmp/ck $BASE/api/raw-batches/RM20260903/trace | head -c 400
+  -d '{"username":"quality","password":"quality123"}'
+# 列表 + 详情（演示批次 LR20260916-01）
+curl -s -b /tmp/ck $BASE/api/live-returns
+curl -s -b /tmp/ck $BASE/api/live-returns/1
+# 复盘（对比主播承诺/实际到货时效/批次检测 → 三类建议 + 下场备货）
+curl -s -b /tmp/ck -X POST $BASE/api/live-returns/1/review
+# 渠道复盘同步
+curl -s -b /tmp/ck -X POST $BASE/api/live-returns/1/sync
 ```
 
 ---
 
-## 六、工程结构
+## 六、本地开发与验证（非 Docker 备选）
+
+> 首选验证方式仍是第一节的 `docker compose up -d`。在无 Docker 的环境，可用本机
+> PostgreSQL 15 + Redis 7 + Go 1.23 直接运行。
+
+```bash
+# 1) 准备数据库（示例：本机 55432 端口、trust 认证）
+initdb -D ./pgdata -U seafood --auth=trust
+echo -e "port=55432\nlisten_addresses='127.0.0.1'" >> ./pgdata/postgresql.conf
+pg_ctl -D ./pgdata -l pg.log start
+createdb -h 127.0.0.1 -p 55432 -U seafood seafood
+redis-server --daemonize yes            # 或已有 Redis
+
+# 2) 编译运行（schema 自动迁移、演示数据幂等播种）
+go build -o /tmp/seafood-app ./cmd/server
+PGHOST=127.0.0.1 PGPORT=55432 PGUSER=seafood PGPASSWORD=seafood_pw PGNAME=seafood \
+REDIS_ADDR=127.0.0.1:6379 APP_PORT=8080 /tmp/seafood-app
+
+# 3) 健康检查
+curl -fsS http://127.0.0.1:8080/healthz   # => {"status":"ok"}
+```
+
+本次实际执行过的验证（本机 PostgreSQL 15 / Redis 7 / Go 1.23）：
+
+- `go build ./...`、`go vet ./...`、`gofmt -l` 全部通过；前端 `node --check app.js` 通过。
+- 服务启动迁移与播种成功，`/healthz` 返回 `{"status":"ok"}`。
+- 用 `quality/quality123` 登录，对演示批次 `LR20260916-01` 完整走通：
+  四因分流（4 类单据各 4 条，退款合计 299.5、扣款合计 179.7）→ `review`
+  （3 条建议；蒜香虾仁备货压减 34.65kg、麻辣鱿鱼花因批次质量停播 0kg）→ `sync`
+  （渠道扣款合计 119.80）→ 渠道回执 → `close`。
+- 财务角色完成直播退款支付与渠道扣款「已扣款」；`production` 角色登记直播退货返回 `403`。
+- 通过 API 新建一场含批次质量异常的集中退货，确认自动生成 `live_return/critical` 品控事件；
+  重复复盘返回 `409`。
+
+---
+
+## 七、工程结构
 
 ```
 .
@@ -149,6 +212,9 @@ curl -s -b /tmp/ck $BASE/api/raw-batches/RM20260903/trace | head -c 400
 │   ├── db/schema.sql           # 全部表结构（启动自动迁移）
 │   ├── db/db.go / seed.go      # 连接重试 / 幂等演示数据
 │   └── api/                    # chi 路由、Redis 会话、各业务处理器、内嵌前端
+│       ├── handlers_live.go        # 直播集中退货登记 + 四类分流单据
+│       ├── handlers_live_review.go # 复盘三维对比 + 三类建议 + 下场备货
+│       ├── handlers_live_sync.go   # 渠道复盘同步 / 回执 / 结案
 │       └── web/                # 单页前端（原生 HTML/CSS/JS，无构建步骤）
 ├── Dockerfile                  # 多阶段构建，非 root 用户 + HEALTHCHECK
 ├── docker-compose.yml          # app + postgres + redis，仅发布 app 端口

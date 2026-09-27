@@ -214,6 +214,147 @@ func Seed(ctx context.Context, p *pgxpool.Pool) error {
 		 SELECT 'EV20260903-01','temp_exceed','major',id,'RM20260903 入库温度 -15.1℃，高于冻品限值 -18℃','open',3
 		 FROM raw_material_batches WHERE batch_no='RM20260903'
 		 ON CONFLICT (event_no) DO NOTHING`,
+
+		// ===== 直播间集中退货演示（已登记、待复盘）=====
+		// 4 个直播渠道订单，分别对应四类退货原因
+		`INSERT INTO orders(order_no,finished_batch_id,channel_id,box_no,qty,customer,status)
+		 SELECT 'OD20260916-L01',f.id,c.id,'BX-LR-0001',2,'直播观众冯**','returned'
+		 FROM finished_batches f, channels c
+		 WHERE f.batch_no='FG20260912-02' AND c.code='CH03'
+		 ON CONFLICT (order_no) DO NOTHING`,
+		`INSERT INTO orders(order_no,finished_batch_id,channel_id,box_no,qty,customer,status)
+		 SELECT 'OD20260916-L02',f.id,c.id,'BX-LR-0002',1,'直播观众陈**','returned'
+		 FROM finished_batches f, channels c
+		 WHERE f.batch_no='FG20260912-01' AND c.code='CH03'
+		 ON CONFLICT (order_no) DO NOTHING`,
+		`INSERT INTO orders(order_no,finished_batch_id,channel_id,box_no,qty,customer,status)
+		 SELECT 'OD20260916-L03',f.id,c.id,'BX-LR-0003',1,'直播观众褚**','returned'
+		 FROM finished_batches f, channels c
+		 WHERE f.batch_no='FG20260912-01' AND c.code='CH03'
+		 ON CONFLICT (order_no) DO NOTHING`,
+		`INSERT INTO orders(order_no,finished_batch_id,channel_id,box_no,qty,customer,status)
+		 SELECT 'OD20260916-L04',f.id,c.id,'BX-LR-0004',1,'直播观众卫**','returned'
+		 FROM finished_batches f, channels c
+		 WHERE f.batch_no='FG20260912-02' AND c.code='CH03'
+		 ON CONFLICT (order_no) DO NOTHING`,
+
+		// 集中退货批次主单（留存主播承诺快照）
+		`INSERT INTO live_return_batches
+		 (return_no,live_session,channel_id,anchor_name,finished_batch_id,
+		  promised_arrival_hours,promised_quality,promised_shelf_life,status,created_by,note)
+		 SELECT 'LR20260916-01','抖音海鲜专场 LS20260916',c.id,'海鲜一姐',f.id,
+		        48,'现剥大颗虾仁/肥厚鱿鱼花，冷链直达、坏单包赔','冷藏保鲜 7 天','registered',3,
+		        '9·16 专场后 48 小时内集中退货，四类原因均有'
+		 FROM channels c, finished_batches f
+		 WHERE c.code='CH03' AND f.batch_no='FG20260912-02'
+		 ON CONFLICT (return_no) DO NOTHING`,
+
+		// 退货明细：批次质量/承诺不符/物流延迟/口味问题
+		`INSERT INTO live_return_items
+		 (live_return_id,order_id,finished_batch_id,box_no,qty,reason,
+		  promised_arrival_hours,actual_arrival_hours,quality_result,evidence)
+		 SELECT b.id,o.id,o.finished_batch_id,v.box,v.qty,v.reason,
+		        v.promised,v.actual,NULLIF(v.quality,''),v.evidence
+		 FROM (VALUES
+		   ('OD20260916-L01','BX-LR-0001',2,'batch_quality',48,56,'unqualified','顾客照片：包装鼓胀、解冻后有氨味'),
+		   ('OD20260916-L02','BX-LR-0002',1,'promise_mismatch',48,40,'','实物虾仁偏小且化冻缩水，与口播大颗虾仁不符'),
+		   ('OD20260916-L03','BX-LR-0003',1,'logistics_delay',48,76,'','物流 76 小时才到，冰袋已化'),
+		   ('OD20260916-L04','BX-LR-0004',1,'taste_issue',48,44,'','调味过咸、腥味重')
+		 ) AS v(order_no,box,qty,reason,promised,actual,quality,evidence)
+		 JOIN orders o ON o.order_no=v.order_no
+		 JOIN live_return_batches b ON b.return_no='LR20260916-01'
+		 WHERE NOT EXISTS (
+		   SELECT 1 FROM live_return_items i WHERE i.live_return_id=b.id AND i.box_no=v.box)`,
+
+		// ① 退款单（59.9 元/盒）
+		`INSERT INTO live_refunds(refund_no,live_return_id,item_id,order_id,amount,reason)
+		 SELECT 'LRF-DEMO-'||i.id,b.id,i.id,i.order_id,ROUND((i.qty*59.9)::numeric,2),
+		        '直播集中退货-'||CASE i.reason
+		          WHEN 'promise_mismatch' THEN '主播承诺不符'
+		          WHEN 'logistics_delay' THEN '物流延迟'
+		          WHEN 'taste_issue' THEN '口味问题'
+		          WHEN 'batch_quality' THEN '批次质量异常' END
+		 FROM live_return_items i JOIN live_return_batches b ON b.id=i.live_return_id
+		 WHERE b.return_no='LR20260916-01'
+		   AND NOT EXISTS (SELECT 1 FROM live_refunds r WHERE r.item_id=i.id)`,
+
+		// 实物退货回厂登记（衔接三态判定流程）
+		`INSERT INTO return_goods(return_no,finished_batch_id,box_no,qty_kg,note)
+		 SELECT 'RT-LRDEMO-'||ROW_NUMBER() OVER (ORDER BY i.id),i.finished_batch_id,i.box_no,
+		        CASE i.box_no WHEN 'BX-LR-0001' THEN 1.0 WHEN 'BX-LR-0002' THEN 0.25
+		                      WHEN 'BX-LR-0003' THEN 0.25 WHEN 'BX-LR-0004' THEN 0.5 END,
+		        '直播集中退货 LR20260916-01（'||CASE i.reason
+		          WHEN 'promise_mismatch' THEN '主播承诺不符'
+		          WHEN 'logistics_delay' THEN '物流延迟'
+		          WHEN 'taste_issue' THEN '口味问题'
+		          WHEN 'batch_quality' THEN '批次质量异常' END||'），待回厂品控判定'
+		 FROM live_return_items i
+		 JOIN live_return_batches b ON b.id=i.live_return_id
+		 WHERE b.return_no='LR20260916-01'
+		   AND NOT EXISTS (SELECT 1 FROM return_goods rg WHERE rg.note LIKE '直播集中退货 LR20260916-01%' AND rg.box_no=i.box_no)`,
+
+		// ② 库存退回单（按原因建议处置）
+		`INSERT INTO live_stock_returns
+		 (stock_no,live_return_id,item_id,return_goods_id,finished_batch_id,box_no,qty_kg,
+		  suggested_disposition,target_location,note)
+		 SELECT 'LRS-DEMO-'||i.id,b.id,i.id,rg.id,i.finished_batch_id,i.box_no,rg.qty_kg,
+		        CASE i.reason WHEN 'taste_issue' THEN 'rework'
+		                      WHEN 'batch_quality' THEN 'destroy'
+		                      ELSE 'reinspect' END,
+		        CASE i.reason WHEN 'taste_issue' THEN '返工区'
+		                      WHEN 'batch_quality' THEN '销毁区'
+		                      ELSE '复检待判区' END,
+		        CASE i.reason
+		          WHEN 'promise_mismatch' THEN '商品本身无质量投诉，复检合格后可再售'
+		          WHEN 'logistics_delay' THEN '时效违约，温度记录/感官待复检确认'
+		          WHEN 'taste_issue' THEN '口味偏差可重新调味返工'
+		          WHEN 'batch_quality' THEN '批次质量异常，禁止再售/返工，必须销毁' END
+		 FROM live_return_items i
+		 JOIN live_return_batches b ON b.id=i.live_return_id
+		 JOIN return_goods rg ON rg.box_no=i.box_no
+		   AND rg.finished_batch_id=i.finished_batch_id AND rg.note LIKE '直播集中退货 LR20260916-01%'
+		 WHERE b.return_no='LR20260916-01'
+		   AND NOT EXISTS (SELECT 1 FROM live_stock_returns s WHERE s.item_id=i.id)`,
+
+		// ③ 客服话术（按原因分别生成）
+		`INSERT INTO live_cs_scripts(script_no,live_return_id,item_id,reason,audience,title,content)
+		 SELECT 'LCS-DEMO-'||i.id,b.id,i.id,i.reason,'直播间下单顾客',
+		        CASE i.reason
+		          WHEN 'promise_mismatch' THEN '主播承诺不符 · 致歉与全额退款话术'
+		          WHEN 'logistics_delay' THEN '物流延迟 · 致歉与运费补偿话术'
+		          WHEN 'taste_issue' THEN '口味问题 · 解释与换货/返工话术'
+		          WHEN 'batch_quality' THEN '批次质量异常 · 紧急停售与召回告知话术' END,
+		        CASE i.reason
+		          WHEN 'promise_mismatch' THEN '您好，经核对直播口播与实物，确有承诺与实物不符，郑重致歉；已发起全额退款（59.9 元/盒，1-3 工作日原路退回），商品冷链取回复检，不再作原单二次销售。'
+		          WHEN 'logistics_delay' THEN '您好，本场承诺 48 小时送达，您实际 76 小时收到，已超时效；办理全额退款并调取该路由冷链温度记录追责承运方，异常商品请勿食用。'
+		          WHEN 'taste_issue' THEN '您好，口味未达预期深表歉意；本单退款（亦可更换口味），退回商品转返工区重新调味评估，下场直播将调整配方并客观标注风味。'
+		          WHEN 'batch_quality' THEN '您好，研判为批次质量风险：该批次立即停售、在库隔离并登记品控事件评估召回；请暂停食用、保留包装拍照，全额退款并按召回政策赔付。' END
+		 FROM live_return_items i JOIN live_return_batches b ON b.id=i.live_return_id
+		 WHERE b.return_no='LR20260916-01'
+		   AND NOT EXISTS (SELECT 1 FROM live_cs_scripts c WHERE c.item_id=i.id)`,
+
+		// ④ 渠道扣款单（按原因适用扣款类型与比例）
+		`INSERT INTO live_channel_charges
+		 (charge_no,live_return_id,item_id,channel_id,amount,charge_type,reason,status)
+		 SELECT 'LCC-DEMO-'||i.id,b.id,i.id,b.channel_id,
+		        ROUND((i.qty*59.9*CASE i.reason
+		          WHEN 'promise_mismatch' THEN 1.0
+		          WHEN 'logistics_delay' THEN 0.8
+		          WHEN 'taste_issue' THEN 0.2
+		          WHEN 'batch_quality' THEN 0.5 END)::numeric,2),
+		        CASE i.reason
+		          WHEN 'promise_mismatch' THEN 'commitment_mismatch'
+		          WHEN 'logistics_delay' THEN 'logistics_breach'
+		          WHEN 'taste_issue' THEN 'service_share'
+		          WHEN 'batch_quality' THEN 'quality_penalty' END,
+		        '9·16 直播专场集中退货对账（'||CASE i.reason
+		          WHEN 'promise_mismatch' THEN '主播承诺不符，全额承担'
+		          WHEN 'logistics_delay' THEN '物流时效违约，80%'
+		          WHEN 'taste_issue' THEN '客诉服务分担，20%'
+		          WHEN 'batch_quality' THEN '批次质量违约金，50%' END||'）','pending'
+		 FROM live_return_items i JOIN live_return_batches b ON b.id=i.live_return_id
+		 WHERE b.return_no='LR20260916-01'
+		   AND NOT EXISTS (SELECT 1 FROM live_channel_charges c WHERE c.item_id=i.id)`,
 	}
 	for _, s := range stmts {
 		if _, err := p.Exec(ctx, s); err != nil {

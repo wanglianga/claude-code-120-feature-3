@@ -121,6 +121,17 @@ func (s *Server) Router() http.Handler {
 			r.Get("/regulatory-samplings", s.listSamplings)
 			r.With(role("quality", "admin", "manager")).Post("/regulatory-samplings", s.createSampling)
 			r.With(role("quality", "admin", "manager")).Post("/regulatory-samplings/{id}/result", s.samplingResult)
+
+			// 直播间集中退货（四类原因分流 → 四类单据 → 复盘 → 渠道同步 → 下场备货）
+			r.Get("/live-returns", s.listLiveReturns)
+			r.Get("/live-returns/{id}", s.getLiveReturn)
+			r.With(role("quality", "warehouse", "admin", "manager")).Post("/live-returns", s.createLiveReturn)
+			r.With(role("quality", "admin", "manager")).Post("/live-returns/{id}/review", s.reviewLiveReturn)
+			r.With(role("quality", "admin", "manager")).Post("/live-returns/{id}/sync", s.syncLiveReview)
+			r.With(role("quality", "admin", "manager")).Post("/live-returns/{id}/syncs/{syncId}/respond", s.respondSync)
+			r.With(role("quality", "admin", "manager")).Post("/live-returns/{id}/close", s.closeLiveReturn)
+			r.With(role("finance", "admin", "manager")).Post("/live-refunds/{id}/pay", s.payLiveRefund)
+			r.With(role("finance", "admin", "manager")).Post("/live-charges/{id}/status", s.updateLiveCharge)
 		})
 	})
 

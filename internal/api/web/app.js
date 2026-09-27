@@ -40,8 +40,9 @@ const STATUS_TAG = {
   open: ['amber', '待处置'], executing: ['red', '执行中'], closed: ['gray', '已结案'],
   sold: ['blue', '已售'], returned: ['amber', '已退货'], compensated: ['green', '已赔付'],
   shipped: ['blue', '已发货'], pending: ['amber', '待处理'], paid: ['green', '已赔付'],
-  confirmed: ['blue', '已确认'], deducted: ['green', '已扣款'],
+  confirmed: ['blue', '已确认'], deducted: ['green', '已扣款'], refunded: ['green', '已退款'],
   qualified: ['green', '合格'], unqualified: ['red', '不合格'],
+  registered: ['amber', '待复盘'], reviewed: ['blue', '已复盘'], synced: ['purple', '渠道已同步'],
 };
 const ETYPE = {
   temp_exceed: '原料温度超标', thaw_timeout: '解冻超时', seasoning_mismatch: '调味料批次用错',
@@ -50,6 +51,20 @@ const ETYPE = {
 };
 const STAGE = { wash: '清洗', trim: '切配', season: '调味', weigh: '称重', package: '包装', metalcheck: '金检', coldstorage: '成品冷库' };
 const DISP = { reinspect: ['amber', '可复检'], rework: ['purple', '可返工'], destroy: ['red', '必须销毁'] };
+const LREASON = {
+  promise_mismatch: ['red', '主播承诺不符'],
+  logistics_delay: ['amber', '物流延迟'],
+  taste_issue: ['purple', '口味问题'],
+  batch_quality: ['red', '批次质量异常'],
+};
+const CHARGE_TYPE = {
+  commitment_mismatch: '主播承诺不符扣款', logistics_breach: '物流时效违约扣款',
+  quality_penalty: '批次质量违约金', service_share: '客诉服务分担扣款',
+};
+const SUG_TYPE = {
+  channel_deduction: ['red', '渠道扣款'], quality_rectification: ['amber', '质量整改'],
+  logistics_accountability: ['blue', '物流追责'],
+};
 const can = (...roles) => roles.includes(state.user.role) || state.user.role === 'admin';
 
 function tag(status) {
@@ -88,7 +103,7 @@ $('#logout-btn').addEventListener('click', async () => {
 const TABS = [
   ['dashboard', '仪表盘'], ['raw', '原料入库'], ['production', '生产加工'],
   ['finished', '成品批次'], ['channel', '渠道履约'], ['events', '品控事件'],
-  ['recalls', '召回管理'], ['returns', '退货处置'], ['inventory', '冷库库存'],
+  ['live', '直播退货'], ['recalls', '召回管理'], ['returns', '退货处置'], ['inventory', '冷库库存'],
   ['finance', '财务追偿'], ['sampling', '监管抽样'],
 ];
 
@@ -109,7 +124,7 @@ function render() {
   const pages = {
     dashboard: pageDashboard, raw: pageRaw, production: pageProduction,
     finished: pageFinished, channel: pageChannel, events: pageEvents,
-    recalls: pageRecalls, returns: pageReturns, inventory: pageInventory,
+    live: pageLive, recalls: pageRecalls, returns: pageReturns, inventory: pageInventory,
     finance: pageFinance, sampling: pageSampling,
   };
   $('#content').innerHTML = '';
@@ -197,6 +212,8 @@ async function pageDashboard() {
       ${kpi(d.events_open, '待处置品控事件', d.events_open ? 'warn' : 'ok')}
       ${kpi(d.recalls_active, '执行中召回', d.recalls_active ? 'danger' : 'ok')}
       ${kpi(d.returns_pending, '退货待判定', d.returns_pending ? 'warn' : 'ok')}
+      ${kpi(d.live_returns_pending_review, '直播退货待复盘', d.live_returns_pending_review ? 'danger' : 'ok')}
+      ${kpi(d.live_charges_pending, '直播渠道扣款待落实', d.live_charges_pending ? 'warn' : 'ok')}
       ${kpi(d.comp_pending, '待支付赔付', d.comp_pending ? 'warn' : 'ok')}
       ${kpi(d.deduction_pending, '待落实供应商扣款', d.deduction_pending ? 'warn' : 'ok')}
     </div>
@@ -205,7 +222,8 @@ async function pageDashboard() {
         ① 在「原料入库」查看 RM20260903（入库温度 -15.1℃ 自动锁定）→ 点「正向追溯」看它流入成品 FG20260912-02；<br>
         ② 在「品控事件」对 <b>EV20260903-01</b> 发起召回，系统自动圈定成品、已发货渠道、在库库存、已售订单（精确到箱）与留样结果，并生成停售/退货/赔偿/供应商追责四类材料；<br>
         ③ 在「召回管理」打开召回单查看材料；「退货处置」登记退货并分别判定 可复检/可返工/必须销毁，观察库存状态变化；<br>
-        ④ 「财务追偿」支付消费者赔付、确认供应商扣款；监管抽样不合格会自动生成监管召回事件。
+        ④ 「财务追偿」支付消费者赔付、确认供应商扣款；监管抽样不合格会自动生成监管召回事件。<br>
+        ⑤ 「直播退货」打开 <b>LR20260916-01</b>：四类原因（承诺不符/物流延迟/口味/批次质量）已分别生成退款、库存退回、客服话术、渠道扣款；点「生成复盘」对比主播承诺·到货时效·批次检测，得出渠道扣款/质量整改/物流追责建议与下场备货调整，再「同步渠道」。
       </div>
     </div></div>`;
 }
@@ -758,6 +776,248 @@ async function pageSampling() {
   };
   $$('button[data-pass]').forEach(b => b.onclick = () => result(b.dataset.pass, 'qualified'));
   $$('button[data-fail]').forEach(b => b.onclick = () => result(b.dataset.fail, 'unqualified'));
+}
+
+/* ---------- 直播间集中退货 ---------- */
+
+async function pageLive() {
+  const rows = await api('/live-returns');
+  const acts = can('quality', 'warehouse', 'manager') ? `<button class="act red" id="new-lr">🎬 登记直播集中退货</button>` : '';
+  $('#content').innerHTML = pageHead('直播间集中退货 · 四因分流 · 复盘备货',
+    '按 主播承诺不符 / 物流延迟 / 口味问题 / 批次质量异常 分流，分别生成退款、库存退回、客服话术、渠道扣款；复盘对比承诺·到货时效·批次检测并同步渠道，结论影响下场备货', acts) +
+    `<div class="panel">${table([
+      { t: '退货批次号', k: 'return_no' },
+      { t: '直播场次', k: 'live_session' },
+      { t: '渠道', k: 'channel' }, { t: '主播', k: 'anchor_name' },
+      { t: '成品', k: 'finished_batch_no' },
+      { t: '承诺不符', fn: r => r.r_promise ? `<span class="tag red">${r.r_promise}</span>` : '—' },
+      { t: '物流延迟', fn: r => r.r_logi ? `<span class="tag amber">${r.r_logi}</span>` : '—' },
+      { t: '口味问题', fn: r => r.r_taste ? `<span class="tag purple">${r.r_taste}</span>` : '—' },
+      { t: '批次质量', fn: r => r.r_batch ? `<span class="tag red">${r.r_batch}</span>` : '—' },
+      { t: '退款合计', fn: r => '¥' + fmtNum(r.refund_total) },
+      { t: '扣款合计', fn: r => '¥' + fmtNum(r.charge_total) },
+      { t: '退回kg', fn: r => fmtNum(r.returned_kg) },
+      { t: '状态', k: 'status', tag: true },
+      { t: '操作', fn: r => `<button class="act" data-view="${r.id}">退货档案/复盘</button>` },
+    ], rows)}</div>`;
+  $('#new-lr')?.addEventListener('click', openLiveReturnForm);
+  $$('button[data-view]').forEach(b => b.onclick = () => showLiveReturn(b.dataset.view));
+}
+
+function openLiveReturnForm() {
+  const reasonOpts = Object.keys(LREASON).map(k => `<option value="${k}">${LREASON[k][1]}</option>`).join('');
+  modalView('登记直播集中退货', `
+    <form id="lr-form" class="form-grid">
+      <label>直播场次号 *<input name="live_session" placeholder="如：抖音海鲜专场 LS20260920" required></label>
+      <label>渠道<select name="channel_code">
+        <option value="CH03">CH03 抖音海鲜直播间</option>
+        <option value="CH02">CH02 天猫旗舰店</option></select></label>
+      <label>主播<input name="anchor_name" placeholder="主播昵称"></label>
+      <label>主涉事成品批号<input name="finished_batch_no" placeholder="FG20260912-02"></label>
+      <label>承诺送达时效(小时)<input name="promised_arrival_hours" type="number" step="0.1" value="48"></label>
+      <label>单价(元/盒)<input name="unit_price" type="number" step="0.01" value="59.9"></label>
+      <label class="full">主播承诺品质/规格快照（口播录屏摘录）<input name="promised_quality"
+        placeholder="如：现剥大颗虾仁，冷链直达，坏单包赔"></label>
+      <label class="full">承诺保鲜/保质期<input name="promised_shelf_life" placeholder="如：冷藏保鲜 7 天"></label>
+      <label class="full">备注<textarea name="note" rows="2"></textarea></label>
+      <div class="full">
+        <div class="lr-row-head">退货明细（逐单归入四类原因，至少 1 条）
+          <button type="button" class="act gray" id="lr-add">➕ 添加退货单</button></div>
+        <table class="lr-items"><thead><tr>
+          <th>订单号</th><th>箱号</th><th>盒数</th><th>退回kg</th><th>原因</th>
+          <th>实际到货h</th><th>到厂质量</th><th>凭证/说明</th><th></th>
+        </tr></thead><tbody id="lr-rows"></tbody></table>
+      </div>
+      <div class="full form-actions">
+        <button type="button" class="act gray" id="mcancel">取消</button>
+        <button type="submit" class="act red">提交集中退货（自动生成四类单据）</button>
+      </div>
+    </form>`);
+  $('#mcancel').onclick = closeModal;
+  const body = $('#lr-rows');
+  const addRow = (def = {}) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><input name="order_no" placeholder="OD..." value="${esc(def.order_no || '')}"></td>
+      <td><input name="box_no" value="${esc(def.box_no || '')}"></td>
+      <td><input name="qty" type="number" step="0.01" value="${def.qty ?? 1}"></td>
+      <td><input name="qty_kg" type="number" step="0.01" value="${def.qty_kg ?? 0.25}"></td>
+      <td><select name="reason">${reasonOpts}</select></td>
+      <td><input name="actual_arrival_hours" type="number" step="0.1" value="${def.actual ?? ''}" placeholder="—"></td>
+      <td><select name="quality_result">
+        <option value="">未判</option><option value="qualified">合格</option><option value="unqualified">不合格</option></select></td>
+      <td><input name="evidence" placeholder="凭证/差评说明"></td>
+      <td><button type="button" class="act gray" data-del>删</button></td>`;
+    if (def.reason) tr.querySelector('[name=reason]').value = def.reason;
+    if (def.quality) tr.querySelector('[name=quality_result]').value = def.quality;
+    tr.querySelector('[data-del]').onclick = () => tr.remove();
+    body.appendChild(tr);
+  };
+  addRow(); addRow();
+  $('#lr-add').onclick = () => addRow();
+  $('#lr-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const head = {};
+    ['live_session','channel_code','anchor_name','finished_batch_no','promised_quality','promised_shelf_life','note']
+      .forEach(k => head[k] = fd.get(k));
+    head.promised_arrival_hours = Number(fd.get('promised_arrival_hours'));
+    head.unit_price = Number(fd.get('unit_price'));
+    head.items = [];
+    $$('#lr-rows tr').forEach(tr => {
+      const g = n => tr.querySelector(`[name=${n}]`);
+      const order_no = g('order_no').value.trim();
+      if (!order_no) return;
+      head.items.push({
+        order_no, box_no: g('box_no').value.trim(),
+        qty: Number(g('qty').value) || 0, qty_kg: Number(g('qty_kg').value) || 0,
+        reason: g('reason').value, actual_arrival_hours: g('actual_arrival_hours').value === '' ? null : Number(g('actual_arrival_hours').value),
+        quality_result: g('quality_result').value, evidence: g('evidence').value.trim(),
+      });
+    });
+    if (!head.items.length) { toast('至少填写一条带订单号的退货明细', 'err'); return; }
+    try {
+      const r = await api('/live-returns', { method: 'POST', body: head });
+      toast(`集中退货 ${r.return_no} 已登记：退款 ¥${r.refund_total} / 扣款 ¥${r.charge_total} / 退回 ${r.stock_return_kg}kg` +
+        (r.auto_event_no ? '，批次质量异常已自动生成品控事件 ' + r.auto_event_no : ''), r.auto_event_no ? 'err' : 'ok');
+      closeModal(); render();
+    } catch (err) { toast(err.message, 'err'); }
+  });
+}
+
+async function showLiveReturn(id) {
+  await renderLiveDetail(id);
+}
+
+async function renderLiveDetail(id) {
+  const d = await api(`/live-returns/${id}`);
+  const b = d.batch;
+  const reviewed = (d.review || []).length > 0;
+  const rv = reviewed ? d.review[0] : null;
+
+  const actionBtns = [];
+  if (b.status === 'registered' && can('quality', 'manager'))
+    actionBtns.push(`<button class="act red" id="lr-review">🔍 生成复盘（对比承诺·到货时效·批次检测）</button>`);
+  if (b.status === 'reviewed' && can('quality', 'manager'))
+    actionBtns.push(`<button class="act" id="lr-sync">📡 同步渠道复盘</button>`);
+  if ((b.status === 'synced' || b.status === 'reviewed') && can('quality', 'manager'))
+    actionBtns.push(`<button class="act gray" id="lr-close">结案</button>`);
+
+  modalView(`直播集中退货 ${b.return_no}（${b.live_session}）`, `
+    <div class="flow-note">
+      渠道：${esc(b.channel)}　主播：${esc(b.anchor_name)}　成品：${esc(b.finished_batch_no)}　状态：${tag(b.status)}<br>
+      <b>主播承诺快照：</b>${esc(b.promised_quality)}；${esc(b.promised_shelf_life)}；承诺 ${b.promised_arrival_hours ?? '—'} 小时送达。
+    </div>
+    ${actionBtns.join(' ')}
+    <div class="trace-grid">
+      <div class="panel full"><h3>退货明细（四类原因）</h3><div class="panel-body">${table([
+        { t: '订单号', k: 'order_no' }, { t: '箱号', k: 'box_no' }, { t: '盒数', k: 'qty' },
+        { t: '退回kg', fn: x => fmtNum(x.qty_kg) },
+        { t: '原因', fn: x => `<span class="tag ${LREASON[x.reason][0]}">${LREASON[x.reason][1]}</span>` },
+        { t: '承诺/实际h', fn: x => `${x.promised_arrival_hours ?? '—'} / ${x.actual_arrival_hours ?? '—'}` },
+        { t: '到厂质量', fn: x => x.quality_result ? tag(x.quality_result) : '待判' },
+        { t: '凭证', k: 'evidence', cls: 'wrap' },
+      ], d.items)}</div></div>
+
+      <div class="panel"><h3>① 退款单（分别生成）</h3><div class="panel-body">${table([
+        { t: '退款单号', k: 'refund_no' }, { t: '订单', k: 'order_no' },
+        { t: '金额', fn: x => '¥' + fmtNum(x.amount) }, { t: '原因', k: 'reason', cls: 'wrap' },
+        { t: '状态', k: 'status', tag: true },
+        { t: '操作', fn: x => (x.status === 'pending' && can('finance', 'manager'))
+          ? `<button class="act green" data-payrefund="${x.id}">退款</button>` : '' },
+      ], d.refunds)}</div></div>
+
+      <div class="panel"><h3>② 库存退回（建议处置 → 三态判定）</h3><div class="panel-body">${table([
+        { t: '库存单号', k: 'stock_no' }, { t: '退货登记', k: 'return_goods_no' },
+        { t: '成品', k: 'finished_batch_no' }, { t: '箱号', k: 'box_no' },
+        { t: 'kg', fn: x => fmtNum(x.qty_kg) },
+        { t: '建议处置', fn: x => DISP[x.suggested_disposition] ? tag(x.suggested_disposition) : x.suggested_disposition },
+        { t: '去向库位', k: 'target_location' },
+      ], d.stocks)}</div></div>
+
+      <div class="panel full"><h3>③ 客服话术（按原因分别生成）</h3><div class="panel-body">
+        ${d.scripts.length ? d.scripts.map(sc => `
+          <div class="doc-card ${sc.reason === 'batch_quality' ? 'clm' : sc.reason === 'logistics_delay' ? 'ret' : 'comp'}">
+            <div class="doc-title">【${LREASON[sc.reason] ? LREASON[sc.reason][1] : sc.reason}】${esc(sc.title)} <span class="tag gray">${esc(sc.script_no)}</span></div>
+            <div class="doc-content">${esc(sc.content)}</div>
+          </div>`).join('') : '<div class="flow-note">无话术</div>'}
+      </div></div>
+
+      <div class="panel full"><h3>④ 渠道扣款（按原因适用不同扣款）</h3><div class="panel-body">${table([
+        { t: '扣款单号', k: 'charge_no' }, { t: '渠道', k: 'channel' },
+        { t: '扣款类型', fn: x => CHARGE_TYPE[x.charge_type] || x.charge_type },
+        { t: '金额', fn: x => '¥' + fmtNum(x.amount) }, { t: '原因', k: 'reason', cls: 'wrap' },
+        { t: '状态', k: 'status', tag: true },
+        { t: '操作', fn: x => (x.status !== 'deducted' && can('finance', 'manager'))
+          ? `<button class="act amber" data-charge="${x.id}" data-st="confirmed">确认</button>
+             <button class="act green" data-charge="${x.id}" data-st="deducted">已扣款</button>` : '' },
+      ], d.charges)}</div></div>
+    </div>
+
+    <h3 style="margin:14px 0 8px">🔍 复盘：主播承诺 / 实际到货时效 / 批次检测对比</h3>
+    ${reviewed ? `
+      <div class="trace-grid">
+        <div class="panel"><h3>主播承诺对比</h3><div class="panel-body"><div class="doc-content">${esc(rv.promise_compare)}</div></div></div>
+        <div class="panel"><h3>实际到货时效对比</h3><div class="panel-body"><div class="doc-content">${esc(rv.logistics_compare)}</div></div></div>
+        <div class="panel full"><h3>批次留样检测对比</h3><div class="panel-body"><div class="doc-content">${esc(rv.quality_compare)}</div></div></div>
+      </div>
+      <h3 style="margin:14px 0 8px">复盘建议（渠道扣款 / 质量整改 / 物流追责）</h3>
+      ${d.suggestions.map(sg => `
+        <div class="doc-card ${sg.stype === 'channel_deduction' ? 'clm' : sg.stype === 'logistics_accountability' ? 'ret' : 'stop'}">
+          <div class="doc-title">【${SUG_TYPE[sg.stype] ? `<span class="tag ${SUG_TYPE[sg.stype][0]}">${SUG_TYPE[sg.stype][1]}</span>` : sg.stype}】${esc(sg.title)}
+            ${sg.amount ? `<span class="tag gray">¥${fmtNum(sg.amount)}</span>` : ''}</div>
+          <div class="doc-content">${esc(sg.content)}</div>
+        </div>`).join('')}
+      <h3 style="margin:14px 0 8px">📦 下一场直播备货建议（复盘结果影响排播备货）</h3>
+      <div class="panel"><div class="table-wrap"><table><thead><tr>
+        <th>产品</th><th>本场发货kg</th><th>退回kg</th><th>退货率</th><th>下场建议备货kg</th><th>依据</th>
+      </tr></thead><tbody>${d.restocks.map(x => `<tr>
+        <td>${esc(x.product_name)}</td><td>${fmtNum(x.shipped_kg)}</td><td>${fmtNum(x.returned_kg)}</td>
+        <td>${fmtNum(x.return_rate)}%</td>
+        <td><b style="color:${Number(x.suggest_qty_kg) === 0 ? '#b91c1c' : '#15803d'}">${fmtNum(x.suggest_qty_kg)}</b></td>
+        <td class="wrap">${esc(x.reason)}</td></tr>`).join('')}</tbody></table></div></div>
+      <h3 style="margin:14px 0 8px">📡 渠道复盘同步</h3>
+      ${d.syncs.length ? d.syncs.map(sy => `
+        <div class="doc-card ret">
+          <div class="doc-title">${esc(sy.sync_no)}　${tag(sy.status)}${sy.synced_at ? '　' + esc(sy.synced_at) : ''}</div>
+          <div class="doc-content">${esc(sy.content)}</div>
+          ${sy.response ? `<div class="doc-meta">渠道回执：${esc(sy.response)}</div>`
+            : (sy.status === 'synced' && can('quality', 'manager') ? `<div class="form-actions"><button class="act" data-syncack="${sy.id}">登记渠道回执确认</button></div>` : '')}
+        </div>`).join('') : '<div class="flow-note">尚未同步渠道</div>'}
+    ` : '<div class="flow-note">该场退货尚未复盘。点击上方「生成复盘」，系统将对比主播承诺、实际到货时效与批次留样检测，输出渠道扣款 / 质量整改 / 物流追责建议，并计算下场备货调整。</div>'}`);
+
+  $('#lr-review')?.addEventListener('click', async () => {
+    try {
+      const r = await api(`/live-returns/${id}/review`, { method: 'POST' });
+      toast(`复盘完成：生成 ${r.suggestions_count} 条建议，下场备货建议已更新`, 'ok');
+      renderLiveDetail(id);
+    } catch (e) { toast(e.message, 'err'); }
+  });
+  $('#lr-sync')?.addEventListener('click', async () => {
+    try {
+      const r = await api(`/live-returns/${id}/sync`, { method: 'POST' });
+      toast(`渠道复盘已同步（${r.sync_no}），含扣款 ¥${r.channel_deduction_total} 与 ${r.restock_products} 个品的备货调整`, 'ok');
+      renderLiveDetail(id);
+    } catch (e) { toast(e.message, 'err'); }
+  });
+  $('#lr-close')?.addEventListener('click', async () => {
+    await api(`/live-returns/${id}/close`, { method: 'POST' });
+    toast('直播退货已结案', 'ok'); closeModal(); render();
+  });
+  $$('#modal button[data-payrefund]').forEach(btn => btn.onclick = async () => {
+    await api(`/live-refunds/${btn.dataset.payrefund}/pay`, { method: 'POST' });
+    toast('退款已支付', 'ok'); renderLiveDetail(id);
+  });
+  $$('#modal button[data-charge]').forEach(btn => btn.onclick = async () => {
+    await api(`/live-charges/${btn.dataset.charge}/status`, { method: 'POST', body: { status: btn.dataset.st } });
+    toast('渠道扣款状态已更新', 'ok'); renderLiveDetail(id);
+  });
+  $$('#modal button[data-syncack]').forEach(btn => btn.onclick = async () => {
+    const response = prompt('登记渠道回执（渠道对扣款/整改/备货的确认意见）') || '';
+    if (!response) return;
+    await api(`/live-returns/${id}/syncs/${btn.dataset.syncack}/respond`, { method: 'POST', body: { response } });
+    toast('渠道回执已登记', 'ok'); renderLiveDetail(id);
+  });
 }
 
 boot();
